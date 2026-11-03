@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <map>
 #include <set>
 #include <vector>
 
@@ -12,21 +13,18 @@
 //
 
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
-//       see the implementation of llama_kv_cache_unified_context_i for an example how to do it
+//       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
 public:
-
-    // this callback is used to filter out layers that should not be included in the cache
-    using layer_filter_cb = std::function<bool(int32_t il)>;
-
     llama_memory_recurrent(
-            const llama_model &  model,
-              layer_filter_cb && filter,
-                    ggml_type    type_r,
-                    ggml_type    type_s,
-                         bool    offload,
-                     uint32_t    mem_size,
-                     uint32_t    n_seq_max);
+            const llama_model & model,
+                    ggml_type   type_r,
+                    ggml_type   type_s,
+                         bool   offload,
+                     uint32_t   mem_size,
+                     uint32_t   n_seq_max,
+                     uint32_t   n_rs_seq,
+        const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
 
@@ -54,6 +52,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there
@@ -63,12 +63,20 @@ public:
 
     // state write/load
 
-    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1) const override;
-    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1) override;
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
+    uint32_t n_rs_seq = 0;
+
+    // per-seq rollback index
+    std::vector<uint32_t> rs_idx;
+
+    void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build
     uint32_t n = 0;
@@ -103,6 +111,8 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    // a second conv history that must stay replicated across devices, so it cannot share the r row
+    std::vector<ggml_tensor *> p_l;
 
 private:
     //const llama_model & model;
@@ -110,19 +120,25 @@ private:
 
     const uint32_t n_seq_max = 1;
 
-    std::vector<ggml_context_ptr>        ctxs;
-    std::vector<ggml_backend_buffer_ptr> bufs;
+    // ggml contexts for the KV cache along with the allocated backend buffers:
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // true if no layers - can happen if the layer filter removes all layers
+    bool is_empty() const;
 
     size_t total_size() const;
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+    size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -162,6 +178,7 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
 

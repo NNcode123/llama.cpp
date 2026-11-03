@@ -1,154 +1,113 @@
-#if defined(_MSC_VER)
-#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
-#endif
-
+#include "ggml-backend.h"
 #include "ggml-rpc.h"
 #ifdef _WIN32
 #  define NOMINMAX
-#  define DIRECTORY_SEPARATOR '\\'
-#  include <locale>
 #  include <windows.h>
 #  include <fcntl.h>
 #  include <io.h>
 #else
-#  define DIRECTORY_SEPARATOR '/'
 #  include <unistd.h>
-#  include <sys/stat.h>
 #endif
-#include <codecvt>
-#include <string>
-#include <stdio.h>
-#include <vector>
-#include <filesystem>
 #include <algorithm>
+#include <clocale>
+#include <codecvt>
+#include <filesystem>
+#include <regex>
+#include <stdio.h>
+#include <string>
 #include <thread>
+#include <vector>
 
-namespace fs = std::filesystem;
+#if !defined(_WIN32)
+#include <sys/types.h>
+#include <pwd.h>
+#endif
+
 
 // NOTE: this is copied from common.cpp to avoid linking with libcommon
-// returns true if successful, false otherwise
-static bool fs_create_directory_with_parents(const std::string & path) {
+static std::string fs_path_to_utf8(const std::filesystem::path & path) {
+    const auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
+
+// common_get_path_from_env() is adapted to avoid utf8_to_wstring
+static std::filesystem::path common_get_path_from_env(const std::string & name) {
 #ifdef _WIN32
-    std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-    std::wstring wpath = converter.from_bytes(path);
-
-    // if the path already exists, check whether it's a directory
-    const DWORD attributes = GetFileAttributesW(wpath.c_str());
-    if ((attributes != INVALID_FILE_ATTRIBUTES) && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-        return true;
+    std::wstring wname;
+    for (const char * p = name.c_str(); *p; ++p) {
+        wname.push_back((wchar_t)*p);
     }
-
-    size_t pos_slash = 0;
-
-    // process path from front to back, procedurally creating directories
-    while ((pos_slash = path.find('\\', pos_slash)) != std::string::npos) {
-        const std::wstring subpath = wpath.substr(0, pos_slash);
-        const wchar_t * test = subpath.c_str();
-
-        const bool success = CreateDirectoryW(test, NULL);
-        if (!success) {
-            const DWORD error = GetLastError();
-
-            // if the path already exists, ensure that it's a directory
-            if (error == ERROR_ALREADY_EXISTS) {
-                const DWORD attributes = GetFileAttributesW(subpath.c_str());
-                if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-
-        pos_slash += 1;
-    }
-
-    return true;
+    const wchar_t * wvalue = _wgetenv(wname.c_str());
+    return wvalue ? std::filesystem::path(wvalue) : std::filesystem::path();
 #else
-    // if the path already exists, check whether it's a directory
-    struct stat info;
-    if (stat(path.c_str(), &info) == 0) {
-        return S_ISDIR(info.st_mode);
-    }
-
-    size_t pos_slash = 1; // skip leading slashes for directory creation
-
-    // process path from front to back, procedurally creating directories
-    while ((pos_slash = path.find('/', pos_slash)) != std::string::npos) {
-        const std::string subpath = path.substr(0, pos_slash);
-        struct stat info;
-
-        // if the path already exists, ensure that it's a directory
-        if (stat(subpath.c_str(), &info) == 0) {
-            if (!S_ISDIR(info.st_mode)) {
-                return false;
-            }
-        } else {
-            // create parent directories
-            const int ret = mkdir(subpath.c_str(), 0755);
-            if (ret != 0) {
-                return false;
-            }
-        }
-
-        pos_slash += 1;
-    }
-
-    return true;
-#endif // _WIN32
+    const char * value = std::getenv(name.c_str());
+    return value ? std::filesystem::path(value) : std::filesystem::path();
+#endif
 }
 
 // NOTE: this is copied from common.cpp to avoid linking with libcommon
-static std::string fs_get_cache_directory() {
-    std::string cache_directory = "";
-    auto ensure_trailing_slash = [](std::string p) {
-        // Make sure to add trailing slash
-        if (p.back() != DIRECTORY_SEPARATOR) {
-            p += DIRECTORY_SEPARATOR;
-        }
-        return p;
-    };
-    if (getenv("LLAMA_CACHE")) {
-        cache_directory = std::getenv("LLAMA_CACHE");
-    } else {
-#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || defined(__OpenBSD__)
-        if (std::getenv("XDG_CACHE_HOME")) {
-            cache_directory = std::getenv("XDG_CACHE_HOME");
-        } else {
-            cache_directory = std::getenv("HOME") + std::string("/.cache/");
-        }
-#elif defined(__APPLE__)
-        cache_directory = std::getenv("HOME") + std::string("/Library/Caches/");
-#elif defined(_WIN32)
-        cache_directory = std::getenv("LOCALAPPDATA");
-#else
-#  error Unknown architecture
-#endif
-        cache_directory = ensure_trailing_slash(cache_directory);
-        cache_directory += "llama.cpp";
+#if !defined(_WIN32)
+static std::filesystem::path get_home_directory() {
+    std::filesystem::path home = common_get_path_from_env("HOME");
+    if (!home.empty()) {
+        return home;
     }
-    return ensure_trailing_slash(cache_directory);
+    const struct passwd * pw = getpwuid(getuid());
+    if (!pw || !pw->pw_dir || !*pw->pw_dir) {
+        throw std::runtime_error("Failed to find $HOME directory");
+    }
+    return pw->pw_dir;
+}
+#endif
+
+// NOTE: this is copied from common.cpp to avoid linking with libcommon
+static std::filesystem::path fs_get_cache_directory() {
+    std::filesystem::path cache_directory = common_get_path_from_env("LLAMA_CACHE");
+    if (!cache_directory.empty()) {
+        return cache_directory;
+    }
+#if defined(_WIN32)
+    cache_directory = common_get_path_from_env("LOCALAPPDATA");
+    if (cache_directory.empty()) {
+        throw std::runtime_error("Failed to find %LOCALAPPDATA% directory");
+    }
+#elif defined(__APPLE__)
+    cache_directory = get_home_directory() / "Library/Caches";
+#else
+    cache_directory = common_get_path_from_env("XDG_CACHE_HOME");
+    if (cache_directory.empty()) {
+        cache_directory = get_home_directory() / ".cache";
+    }
+#endif
+    return cache_directory / "llama.cpp";
+}
+
+// NOTE: this is copied from common.h to avoid linking with libcommon
+static bool common_create_directories(const std::filesystem::path & path, std::error_code & ec) {
+#if defined(__linux__)
+    return std::filesystem::create_directories(path / "", ec);
+#else
+    return std::filesystem::create_directories(path, ec);
+#endif
 }
 
 struct rpc_server_params {
-    std::string host        = "127.0.0.1";
-    int         port        = 50052;
-    size_t      backend_mem = 0;
-    bool        use_cache   = false;
-    int         n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
-    std::string device;
+    std::string              host        = "127.0.0.1";
+    int                      port        = 50052;
+    bool                     use_cache   = false;
+    int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+    std::vector<std::string> devices;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "Usage: %s [options]\n\n", argv[0]);
     fprintf(stderr, "options:\n");
-    fprintf(stderr, "  -h, --help                show this help message and exit\n");
-    fprintf(stderr, "  -t,      --threads        number of threads for the CPU backend (default: %d)\n", params.n_threads);
-    fprintf(stderr, "  -d DEV,  --device         device to use\n");
-    fprintf(stderr, "  -H HOST, --host HOST      host to bind to (default: %s)\n", params.host.c_str());
-    fprintf(stderr, "  -p PORT, --port PORT      port to bind to (default: %d)\n", params.port);
-    fprintf(stderr, "  -m MEM,  --mem MEM        backend memory size (in MB)\n");
-    fprintf(stderr, "  -c,      --cache          enable local file cache\n");
+    fprintf(stderr, "  -h, --help                       show this help message and exit\n");
+    fprintf(stderr, "  -t, --threads N                  number of threads for the CPU device (default: %d)\n", params.n_threads);
+    fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
+    fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
+    fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+    fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "\n");
 }
 
@@ -174,17 +133,17 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             if (++i >= argc) {
                 return false;
             }
-            params.device = argv[i];
-            if (ggml_backend_dev_by_name(params.device.c_str()) == nullptr) {
-                fprintf(stderr, "error: unknown device: %s\n", params.device.c_str());
-                fprintf(stderr, "available devices:\n");
-                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                    auto * dev = ggml_backend_dev_get(i);
-                    size_t free, total;
-                    ggml_backend_dev_memory(dev, &free, &total);
-                    printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
+            const std::regex regex{ R"([,/]+)" };
+            std::string dev_str = argv[i];
+            std::sregex_token_iterator iter(dev_str.begin(), dev_str.end(), regex, -1);
+            std::sregex_token_iterator end;
+            for ( ; iter != end; ++iter) {
+                try {
+                    params.devices.push_back(*iter);
+                } catch (const std::exception & ) {
+                    fprintf(stderr, "error: invalid device: %s\n", iter->str().c_str());
+                    return false;
                 }
-                return false;
             }
         } else if (arg == "-p" || arg == "--port") {
             if (++i >= argc) {
@@ -196,11 +155,6 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
-        } else if (arg == "-m" || arg == "--mem") {
-            if (++i >= argc) {
-                return false;
-            }
-            params.backend_mem = std::stoul(argv[i]) * 1024 * 1024;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -213,54 +167,52 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
     return true;
 }
 
-static ggml_backend_t create_backend(const rpc_server_params & params) {
-    ggml_backend_t backend = nullptr;
+static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & params) {
+    std::vector<ggml_backend_dev_t> devices;
+    if (!params.devices.empty()) {
+        for (auto device : params.devices) {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(device.c_str());
+            if (dev) {
+                devices.push_back(dev);
+            } else {
+                fprintf(stderr, "error: unknown device: %s\n", device.c_str());
+                fprintf(stderr, "available devices:\n");
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    auto * dev = ggml_backend_dev_get(i);
+                    size_t free, total;
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
+                }
+                return {};
+            }
+        }
+    }
 
-    if (!params.device.empty()) {
-        ggml_backend_dev_t dev = ggml_backend_dev_by_name(params.device.c_str());
+    // Try non-CPU devices first
+    if (devices.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev);
+            if (dev_type != GGML_BACKEND_DEVICE_TYPE_CPU && dev_type != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                devices.push_back(dev);
+            }
+        }
+    }
+
+    // If there are no accelerators, fallback to CPU device
+    if (devices.empty()) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (dev) {
-            backend = ggml_backend_dev_init(dev, nullptr);
-            if (!backend) {
-                fprintf(stderr, "Failed to create backend for device %s\n", params.device.c_str());
-                return nullptr;
-            }
+            devices.push_back(dev);
         }
     }
 
-    // try to initialize a GPU backend first
-    if (!backend) {
-        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
-    }
-
-    // if there aren't GPU backends fallback to CPU backend
-    if (!backend) {
-        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    }
-
-    if (backend) {
-        fprintf(stderr, "%s: using %s backend\n", __func__, ggml_backend_name(backend));
-
-        // set the number of threads
-        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-        if (reg) {
-            auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-            if (ggml_backend_set_n_threads_fn) {
-                ggml_backend_set_n_threads_fn(backend, params.n_threads);
-            }
-        }
-    }
-
-    return backend;
-}
-
-static void get_backend_memory(ggml_backend_t backend, size_t * free_mem, size_t * total_mem) {
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    GGML_ASSERT(dev != nullptr);
-    ggml_backend_dev_memory(dev, free_mem, total_mem);
+    return devices;
 }
 
 int main(int argc, char * argv[]) {
+    std::setlocale(LC_NUMERIC, "C");
+
     ggml_backend_load_all();
 
     rpc_server_params params;
@@ -279,27 +231,23 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "\n");
     }
 
-    ggml_backend_t backend = create_backend(params);
-    if (!backend) {
-        fprintf(stderr, "Failed to create backend\n");
+    auto devices = get_devices(params);
+    if (devices.empty()) {
+        fprintf(stderr, "No devices found\n");
         return 1;
     }
     std::string endpoint = params.host + ":" + std::to_string(params.port);
-    size_t free_mem, total_mem;
-    if (params.backend_mem > 0) {
-        free_mem = params.backend_mem;
-        total_mem = params.backend_mem;
-    } else {
-        get_backend_memory(backend, &free_mem, &total_mem);
-    }
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
     if (params.use_cache) {
-        cache_dir_str = fs_get_cache_directory() + "rpc/";
-        if (!fs_create_directory_with_parents(cache_dir_str)) {
-            fprintf(stderr, "Failed to create cache directory: %s\n", cache_dir_str.c_str());
+        const std::filesystem::path cache_dir_path = fs_get_cache_directory() / "rpc";
+        std::error_code ec;
+        common_create_directories(cache_dir_path, ec);
+        if (ec) {
+            fprintf(stderr, "Failed to create cache directory: %s\n", fs_path_to_utf8(cache_dir_path).c_str());
             return 1;
         }
+        cache_dir_str = fs_path_to_utf8(cache_dir_path);
         cache_dir = cache_dir_str.c_str();
     }
 
@@ -315,8 +263,6 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    start_server_fn(backend, endpoint.c_str(), cache_dir, free_mem, total_mem);
-
-    ggml_backend_free(backend);
+    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
     return 0;
 }

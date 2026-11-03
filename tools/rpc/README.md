@@ -4,8 +4,8 @@
 > This example and the RPC backend are currently in a proof-of-concept development stage. As such, the functionality is fragile and
 > insecure. **Never run the RPC server on an open network or in a sensitive environment!**
 
-The `rpc-server` allows  running `ggml` backend on a remote host.
-The RPC backend communicates with one or several instances of `rpc-server` and offloads computations to them.
+The `ggml-rpc-server` allows exposing `ggml` devices on a remote host.
+The RPC backend communicates with one or several instances of `ggml-rpc-server` and offloads computations to them.
 This can be used for distributed LLM inference with `llama.cpp` in the following way:
 
 ```mermaid
@@ -14,28 +14,34 @@ flowchart TD
     rpcb<-->|TCP|srvb
     rpcb<-.->|TCP|srvn
     subgraph hostn[Host N]
-    srvn[rpc-server]<-.->backend3["Backend (CUDA,Metal,etc.)"]
+    srvn[ggml-rpc-server]<-.->dev4["CUDA0"]
+    srvn[ggml-rpc-server]<-.->dev5["CPU"]
     end
     subgraph hostb[Host B]
-    srvb[rpc-server]<-->backend2["Backend (CUDA,Metal,etc.)"]
+    srvb[ggml-rpc-server]<-->dev3["Metal"]
     end
     subgraph hosta[Host A]
-    srva[rpc-server]<-->backend["Backend (CUDA,Metal,etc.)"]
+    srva[ggml-rpc-server]<-->dev["CUDA0"]
+    srva[ggml-rpc-server]<-->dev2["CUDA1"]
     end
     subgraph host[Main Host]
-    local["Backend (CUDA,Metal,etc.)"]<-->ggml[llama-cli]
+    local["Local devices"]<-->ggml[llama-cli]
     ggml[llama-cli]<-->rpcb[RPC backend]
     end
     style hostn stroke:#66,stroke-width:2px,stroke-dasharray: 5 5
+    classDef devcls fill:#5B9BD5
+    class local,dev,dev2,dev3,dev4,dev5 devcls
 ```
 
-Each host can run a different backend, e.g. one with CUDA and another with Metal.
-You can also run multiple `rpc-server` instances on the same host, each with a different backend.
+By default, `ggml-rpc-server` exposes all available accelerator devices on the host.
+If there are no accelerators, it exposes a single `CPU` device.
 
 ## Usage
 
-On each host, build the corresponding backend with `cmake` and add `-DGGML_RPC=ON` to the build options.
-For example, to build the CUDA backend with RPC support:
+### Remote hosts
+
+On each remote host, build the backends for each accelerator by adding `-DGGML_RPC=ON` to the build options.
+For example, to build the `ggml-rpc-server` with support for CUDA accelerators:
 
 ```bash
 mkdir build-rpc-cuda
@@ -44,33 +50,38 @@ cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON
 cmake --build . --config Release
 ```
 
-Then, start the `rpc-server` with the backend:
+When started, the `ggml-rpc-server` will detect and expose all available `CUDA` devices:
 
 ```bash
-$ bin/rpc-server -p 50052
-create_backend: using CUDA backend
-ggml_cuda_init: GGML_CUDA_FORCE_MMQ:   no
-ggml_cuda_init: CUDA_USE_TENSOR_CORES: yes
+$ bin/ggml-rpc-server
+ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
+ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
 ggml_cuda_init: found 1 CUDA devices:
-  Device 0: NVIDIA T1200 Laptop GPU, compute capability 7.5, VMM: yes
-Starting RPC server on 0.0.0.0:50052
+  Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes
+Starting RPC server v3.0.0
+  endpoint       : 127.0.0.1:50052
+  local cache    : n/a
+Devices:
+  CUDA0: NVIDIA GeForce RTX 5090 (32109 MiB, 31588 MiB free)
 ```
 
-When using the CUDA backend, you can specify the device with the `CUDA_VISIBLE_DEVICES` environment variable, e.g.:
+You can control the set of exposed CUDA devices with the `CUDA_VISIBLE_DEVICES` environment variable or the `--device` command line option. The following two commands have the same effect:
 ```bash
-$ CUDA_VISIBLE_DEVICES=0 bin/rpc-server -p 50052
+$ CUDA_VISIBLE_DEVICES=0 bin/ggml-rpc-server -p 50052
+$ bin/ggml-rpc-server --device CUDA0 -p 50052
 ```
-This way you can run multiple `rpc-server` instances on the same host, each with a different CUDA device.
 
+### Main host
 
-On the main host build `llama.cpp` for the local backend and add `-DGGML_RPC=ON` to the build options.
-Finally, when running `llama-cli`, use the `--rpc` option to specify the host and port of each `rpc-server`:
+On the main host build `llama.cpp` with the backends for the local devices and add `-DGGML_RPC=ON` to the build options.
+Finally, when running `llama-cli` or `llama-server`, use the `--rpc` option to specify the host and port of each `ggml-rpc-server`:
 
 ```bash
-$ bin/llama-cli -m ../models/tinyllama-1b/ggml-model-f16.gguf -p "Hello, my name is" --repeat-penalty 1.0 -n 64 --rpc 192.168.88.10:50052,192.168.88.11:50052 -ngl 99
+$ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,192.168.88.11:50052
 ```
 
-This way you can offload model layers to both local and remote devices.
+By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
+You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
 
 ### Local cache
 
@@ -79,7 +90,48 @@ This can speed up model loading significantly, especially when using large model
 To enable the cache, use the `-c` option:
 
 ```bash
-$ bin/rpc-server -c
+$ bin/ggml-rpc-server -c
 ```
 
 By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory and can be controlled via the `LLAMA_CACHE` environment variable.
+
+### RDMA transport
+
+The RPC backend can use RDMA instead of TCP for lower latency and higher throughput. The transport is negotiated during the initial handshake -- no changes to command-line usage are required, and the connection falls back to TCP unless both peers can use RDMA.
+
+Two providers are supported, each enabled by default when its library is found at build time:
+
+- **Linux**: RoCEv2-capable NICs (e.g. Mellanox ConnectX), via `libibverbs`.
+- **macOS**: RDMA over Thunderbolt on Apple silicon Macs with Thunderbolt 5, via `librdma`. Requires macOS 26.2 or later, with RDMA enabled once from macOS Recovery via `rdma_ctl enable`. See [TN3205](https://developer.apple.com/documentation/technotes/tn3205-low-latency-communication-with-rdma-over-thunderbolt).
+
+RDMA is point-to-point, so each side uses the local device whose GID matches the address the connection was made on. Connect over the RDMA-capable link -- with Thunderbolt, use the peer's Thunderbolt address in `--rpc`; a connection made over another interface stays on TCP.
+
+To force plain TCP without rebuilding, set `GGML_RPC_NO_RDMA` on either peer:
+```bash
+$ GGML_RPC_NO_RDMA=1 bin/ggml-rpc-server
+```
+
+### Troubleshooting
+
+The `GGML_RPC_DEBUG` environment variable controls the verbosity of the logs emitted by the RPC backend.
+It can be set on the server, on the client (e.g. `llama-cli`), or both. Larger values produce more detailed output:
+
+- unset / `0` - disabled (only warnings and errors are printed)
+- `1` - high-level events: connections, handshake, buffer allocations, graph computes, cache evictions
+- `2` - per-command trace: every RPC message sent/received, tensor transfers, cache hits/misses
+- `3` - fine detail: per-command timings, graph node dumps, transport byte counts
+
+Non-numeric values are treated as `1`.
+
+```bash
+$ GGML_RPC_DEBUG=1 bin/ggml-rpc-server
+```
+
+> [!NOTE]
+> The debug levels are emitted as `ggml` debug records, which `llama.cpp` applications drop unless the
+> global verbosity threshold is raised. On the client, pass `-lv 5` together with `GGML_RPC_DEBUG`:
+
+```bash
+$ GGML_RPC_DEBUG=2 bin/llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052 -lv 5
+```
+

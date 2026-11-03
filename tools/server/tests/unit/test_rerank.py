@@ -4,7 +4,7 @@ from utils import *
 server = ServerPreset.jina_reranker_tiny()
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(autouse=True)
 def create_server():
     global server
     server = ServerPreset.jina_reranker_tiny()
@@ -39,6 +39,31 @@ def test_rerank():
     assert most_relevant["relevance_score"] > least_relevant["relevance_score"]
     assert most_relevant["index"] == 2
     assert least_relevant["index"] == 3
+
+
+@pytest.mark.parametrize("kv_unified", [False, True])
+def test_rerank_skips_prompt_cache(kv_unified, tmp_path):
+    global server
+    server.n_slots = 2
+    server.cache_ram = 100
+    server.kv_unified = kv_unified
+    server.debug = True
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    for i in range(4):
+        res = server.make_request("POST", "/rerank", data={
+            "query": f"query {i}",
+            "documents": TEST_DOCUMENTS[i:],
+        })
+        assert res.status_code == 200
+
+    server.stop()
+
+    with open(server.log_path) as f:
+        log = f.read()
+    assert "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__" in log
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log
 
 
 def test_rerank_tei_format():
@@ -102,3 +127,45 @@ def test_rerank_usage(query, doc1, doc2, n_tokens):
     assert res.status_code == 200
     assert res.body['usage']['prompt_tokens'] == res.body['usage']['total_tokens']
     assert res.body['usage']['prompt_tokens'] == n_tokens
+
+
+@pytest.mark.parametrize("top_n,expected_len", [
+    (None, len(TEST_DOCUMENTS)),  # no top_n parameter
+    (2, 2),
+    (4, 4),
+    (99, len(TEST_DOCUMENTS)),    # higher than available docs
+])
+def test_rerank_top_n(top_n, expected_len):
+    global server
+    server.start()
+    data = {
+        "query": "Machine learning is",
+        "documents": TEST_DOCUMENTS,
+    }
+    if top_n is not None:
+        data["top_n"] = top_n
+
+    res = server.make_request("POST", "/rerank", data=data)
+    assert res.status_code == 200
+    assert len(res.body["results"]) == expected_len
+
+
+@pytest.mark.parametrize("top_n,expected_len", [
+    (None, len(TEST_DOCUMENTS)),  # no top_n parameter
+    (2, 2),
+    (4, 4),
+    (99, len(TEST_DOCUMENTS)),    # higher than available docs
+])
+def test_rerank_tei_top_n(top_n, expected_len):
+    global server
+    server.start()
+    data = {
+        "query": "Machine learning is",
+        "texts": TEST_DOCUMENTS,
+    }
+    if top_n is not None:
+        data["top_n"] = top_n
+
+    res = server.make_request("POST", "/rerank", data=data)
+    assert res.status_code == 200
+    assert len(res.body) == expected_len
