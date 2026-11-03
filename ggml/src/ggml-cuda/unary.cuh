@@ -1,5 +1,6 @@
 #pragma once
 #include "common.cuh"
+#include "ggml-impl.h"
 
 #define CUDA_NEG_BLOCK_SIZE 256
 #define CUDA_STEP_BLOCK_SIZE 256
@@ -81,9 +82,10 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
-
 void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+
+
 
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -121,3 +123,21 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+__device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float gate, float up, float limit) {
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:
+            return up * ggml_cuda_op_silu_single(gate);
+        case GGML_GLU_OP_GEGLU:
+            return up * ggml_cuda_op_gelu_single(gate);
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_cuda_op_swiglu_oai_single(gate, up);
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            return ggml_cuda_op_swiglu_clamp_single(gate, up, limit);
+        default:
+            return up * gate;
+    }
+}
+
+
+

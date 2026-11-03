@@ -702,79 +702,141 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     }
 }
 
-/* fused unary + mul */
+template <typename T>
+static __global__ void ggml_cuda_op_swiglu_clamp_kernel(const T* __restrict__ gate, const T* __restrict__ src, T* __restrict__ dest, 
+                                                size_t size, size_t dim1, size_t dim0, int64_t gstrd1,
+                                                int64_t dstrd1, int64_t gstrd0, int64_t dstrd0,
+                                                float clamp_val) {
+    
+    size_t index = blockDim.x * blockIdx.x + threadIdx.x;
 
-template <float (*op)(float)>
-static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
-    // unary_node: UNARY op applied to unary_node->src[0]
-    // mul_node:   MUL(a, b) where one of a/b is unary_node
-    // Output goes to mul_node->data
+    if (index < size && index / dim0 < dim1){
 
-    const ggml_tensor * unary_src = unary_node->src[0];  // input to the unary op
-    const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
+        size_t g_ind = ((index) / dim0)  * gstrd1 + (index % dim0) * gstrd0;
 
-    GGML_ASSERT(ggml_is_contiguous_1(unary_src));
-    GGML_ASSERT(unary_src->nb[0] == ggml_element_size(unary_src));
-    GGML_ASSERT(ggml_is_contiguous_1(other_src));
-    GGML_ASSERT(other_src->nb[0] == ggml_element_size(other_src));
-    GGML_ASSERT(ggml_are_same_shape(unary_src, other_src));
+        size_t src_ind = (gate == src) ? g_ind:  ((index)/ dim0 ) *  dstrd1 + (index %  dim0) * dstrd0;
+        
+        dest[index] = (T) ggml_cuda_op_swiglu_clamp_single(
+                (float) gate[g_ind], (float) src[src_ind], clamp_val);
 
-    GGML_ASSERT(unary_src->type == GGML_TYPE_F32 || unary_src->type == GGML_TYPE_F16 || unary_src->type == GGML_TYPE_BF16);
-    GGML_ASSERT(unary_src->type == other_src->type);
-    GGML_ASSERT(unary_src->type == mul_node->type);
+    }
+
+
+}
+
+template <typename T>
+static void launch_cuda_swiglu_clamp(const T* __restrict__ gate, const T* __restrict__ src, T* __restrict__ dest, 
+                                                size_t size, size_t dim1, size_t dim0, size_t gstrd1,
+                                                size_t gstrd0, size_t dstrd1, size_t dstrd0,
+                                                float clamp_val, cudaStream_t stream) {
+
+    if (size == 0) {
+        return;
+    }
+    const int num_blocks = (int) ((size + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE);
+    ggml_cuda_op_swiglu_clamp_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
+            gate, src, dest, size, dim1, dim0, gstrd1, dstrd1, gstrd0, dstrd0, clamp_val);
+
+                                                }
+
+
+void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context& ctx, ggml_tensor* tensor){
+
 
     cudaStream_t stream = ctx.stream();
 
-    const int64_t k  = ggml_nelements(mul_node);
-    const int64_t nc = unary_src->ne[0];
-    const int64_t unary_stride = unary_src->nb[1];
-    const int64_t other_stride = other_src->nb[1];
+    const ggml_tensor* gate = tensor->src[0];
 
-    if (unary_src->type == GGML_TYPE_F16) {
-        unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,
-                             (half *) mul_node->data, k, nc,
-                             unary_stride / sizeof(half), other_stride / sizeof(half), stream);
-    } else if (unary_src->type == GGML_TYPE_BF16) {
-        unary_gated_cuda<op>((const nv_bfloat16 *) unary_src->data, (const nv_bfloat16 *) other_src->data,
-                             (nv_bfloat16 *) mul_node->data, k, nc,
-                             unary_stride / sizeof(nv_bfloat16), other_stride / sizeof(nv_bfloat16), stream);
-    } else {
-        unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
-                             (float *) mul_node->data, k, nc,
-                             unary_stride / sizeof(float), other_stride / sizeof(float), stream);
+    const ggml_tensor* src = tensor->src[1];
+
+    size_t gdim0  = src ? gate->ne[0] : gate->ne[0]/2, gdim1 = gate->ne[1];
+
+    int64_t gsb0 = gate->nb[0], gsb1 = gate->nb[1];
+
+    const void* gate_d = gate->data;
+
+    const void* src_d = src ? src->data: gate->data;
+
+    size_t sdim0 = src ? src->ne[0]: gate->ne[0]/2, sdim1 = src ? src->ne[1]: gate->ne[1];
+
+    int64_t ssb0 = src ? src->nb[0]: gate -> nb[0], ssb1 = src ? src->nb[1]: gate->nb[1];
+
+    GGML_ASSERT(ggml_is_contiguous_strided_1(gate));
+
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 || gate->type == GGML_TYPE_F16);
+
+    GGML_ASSERT(ggml_is_contiguous(tensor));
+
+    GGML_ASSERT(gdim0 == sdim0 && gdim1 == sdim1);
+
+    
+
+    GGML_ASSERT(tensor->ne[0] == gdim0);
+
+    GGML_ASSERT(ggml_nrows(gate) == ggml_nrows(tensor));
+
+    if (src){
+
+        GGML_ASSERT(ggml_is_contiguous_strided_1(src));
+
+        GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
+
+        GGML_ASSERT(src->type == gate->type);
+
+        GGML_ASSERT(ggml_nelements(src) == ggml_nelements(gate));
+
     }
-}
 
-void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
-    switch (ggml_get_unary_op(unary_node)) {
-        case GGML_UNARY_OP_SILU:
-            ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
-            break;
-        case GGML_UNARY_OP_SIGMOID:
-            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
-            break;
-        case GGML_UNARY_OP_SOFTPLUS:
-            ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node);
-            break;
-        default:
-            GGML_ABORT("Unsupported unary op for fused unary+mul");
+    int32_t swapped = ggml_get_op_params_i32(tensor, 1);
+
+    const float alpha = ggml_get_op_params_f32(tensor, 2);
+
+    const float limit = ggml_get_op_params_f32(tensor, 3);
+
+    
+
+    if (!src) {
+        // Both values share gate's storage; select the appropriate half of each row.
+        src_d = (const char *) src_d + (swapped ? 0 : sdim0 * ssb0);
+        gate_d = (const char *) gate_d + (swapped ? gdim0 * gsb0 : 0);
     }
-}
 
-/* fused relu + sqr */
+    GGML_ASSERT(tensor->type == gate->type);
 
-void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
-    const ggml_tensor * src = relu_node->src[0];
-    cudaStream_t stream = ctx.stream();
+    const size_t type_size = ggml_type_size(gate->type);
+    const size_t size = ggml_nelements(tensor);
+    const size_t nrows = ggml_nrows(tensor);
+    const size_t gstrd1 = gsb1 / type_size;
+    const size_t dstrd1 = ssb1 / type_size;
+    const size_t gstrd0 = gsb0 / type_size;
+    const size_t dstrd0 = ssb0 / type_size;
 
-    GGML_ASSERT(ggml_is_contiguous(src));
-    GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
-    GGML_ASSERT(src->type == sqr_node->type);
+    if (tensor->type == GGML_TYPE_F32){
 
-    const int k = ggml_nelements(src);
-    if (src->type == GGML_TYPE_F16) {
-        unary_cuda<op_relu_sqr>((const half *)src->data, (half *)sqr_node->data, k, stream);
-    } else {
-        unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
+        const float* fsrc_d = (const float*) src_d;
+        const float* fgate_d = (const float*) gate_d;
+        launch_cuda_swiglu_clamp(fgate_d, fsrc_d, (float *) tensor->data,
+                size, nrows, gdim0, gstrd1, gstrd0, dstrd1, dstrd0, limit, stream);
+
     }
+
+
+    else if (tensor->type == GGML_TYPE_F16){
+
+        const half* hsrc_d = (const half*) src_d;
+        const half* hgate_d = (const half*) gate_d;
+        launch_cuda_swiglu_clamp(hgate_d, hsrc_d, (half *) tensor->data,
+                size, nrows, gdim0, gstrd1, gstrd0, dstrd1, dstrd0, limit, stream);
+
+    }
+
+    
+    
+
+  
+   
+    
+
+   
+
 }
